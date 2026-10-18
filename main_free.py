@@ -129,7 +129,8 @@ def _openrouter_free_model() -> str | None:
 
 
 def _pollinations(temp: float, timeout: int = 240) -> PacedLlm:
-    return _openai_compat("openai", POLLINATIONS_BASE, "anonymous", interval=16, temp=temp,
+    # anonymous tier: "1 reply every 30 seconds per IP" -> pace all Pollinations calls 35 s apart
+    return _openai_compat("openai", POLLINATIONS_BASE, "anonymous", interval=35, temp=temp,
                           timeout=timeout, tries=5)
 
 
@@ -177,7 +178,9 @@ def pick_llms() -> tuple[str, dict]:
                 "parser": GeneralLlm(model=parse_m, temperature=0.0, timeout=60, allowed_tries=3),
                 "researcher": "free-web",
             }
-        os.environ.setdefault("OPENROUTER_FREE_KEY", key)  # personal key without credits -> :free models
+        if not _real("OPENROUTER_FREE_KEY"):  # personal key without credits -> :free models
+            # (GitHub Actions passes unset secrets as "", so setdefault() would never fire)
+            os.environ["OPENROUTER_FREE_KEY"] = key
     if _real("GROQ_API_KEY"):
         main_m = os.getenv("FORECAST_MODEL", "groq/openai/gpt-oss-120b")
         parse_m = os.getenv("PARSER_MODEL", "groq/llama-3.1-8b-instant")
@@ -322,6 +325,27 @@ async def free_web_research(q: MetaculusQuestion, max_chars: int = 9000) -> str:
 class FreeTierBot(FallTemplateBot2026):
     _structure_output_validation_samples = 1
 
+    async def _binary_prompt_to_forecast(self, question, prompt):
+        """Read the final "Probability: ZZ%" line directly; only call the LLM parser if it is missing.
+        Saves a free-tier request per sample and avoids weak-parser failures."""
+        import re
+        from forecasting_tools import ReasonedPrediction
+        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        hits = re.findall(r"Probability\W{0,3}\s*:?\s*\**\s*(\d{1,3}(?:\.\d+)?)\s*%", reasoning or "", re.I)
+        if hits:
+            p = max(0.01, min(0.99, float(hits[-1]) / 100))
+            logger.info(f"Forecasted URL {question.page_url} with prediction: {p} (regex parse).")
+            return ReasonedPrediction(prediction_value=p, reasoning=reasoning)
+        return await self._parse_binary_with_llm(question, reasoning)
+
+    async def _parse_binary_with_llm(self, question, reasoning):
+        from forecasting_tools import BinaryPrediction, ReasonedPrediction, structure_output
+        pred = await structure_output(reasoning, BinaryPrediction, model=self.get_llm("parser", "llm"),
+                                      num_validation_samples=1)
+        p = max(0.01, min(0.99, pred.prediction_in_decimal))
+        return ReasonedPrediction(prediction_value=p, reasoning=reasoning)
+
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             research = ""
@@ -420,5 +444,11 @@ if __name__ == "__main__":
         bot.skip_previously_forecasted_questions = False
         reports = asyncio.run(bot.forecast_on_tournament("bot-testing-area", return_exceptions=True))
         url = "https://www.metaculus.com/tournament/bot-testing-area/"
-    bot.log_report_summary(reports)
+    ok = [r for r in reports if not isinstance(r, BaseException)]
+    try:
+        bot.log_report_summary(reports)
+    except RuntimeError as e:  # some questions failed; only fail the job if none succeeded
+        logger.error(f"{len(reports) - len(ok)} of {len(reports)} questions failed: {str(e)[:500]}")
+        if reports and not ok:
+            raise
     print_run_summary_banner(reports, will_publish=publish, tournament_url=url)
